@@ -192,7 +192,9 @@ def fix_og_tags(
         url_added = add_og_url_if_missing(soup, page_url)
 
         new_title = None
-        request_match = REQUEST_PATH_RE.match(urlparse(page_url).path)
+        parsed_path = urlparse(page_url).path
+        request_match = REQUEST_PATH_RE.match(parsed_path)
+        logging.info("path=%r matched=%s cookies=%s", parsed_path, bool(request_match), cookies)
         title_changed = False
         if request_match:
             subject = fetch_request_subject(request_match.group(1), cookies, extra_headers)
