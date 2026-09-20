@@ -18,6 +18,17 @@ def og_content(html_bytes: bytes, property_name: str):
     tag = soup.head.find("meta", attrs={"property": property_name})
     return tag["content"] if tag else None
 
+
+def header(headers: dict, name: str):
+    """Case-insensitive header lookup - HTTP header names are
+    case-insensitive on the wire, so tests shouldn't assume a specific
+    casing survived whatever normalization happened along the way."""
+    lname = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lname:
+            return v
+    return None
+
 PAGE_URL = "https://photos.example.com/mo/sharing/ABC123"
 
 RELATIVE_IMAGE_HTML = b"""<!DOCTYPE html><html><head>
@@ -136,6 +147,28 @@ def test_request_subject_fetch_uses_the_undocumented_required_recipe():
     assert kwargs["data"]["passphrase"] == '"REQ123"'
 
 
+def test_request_subject_fetch_forwards_client_ip_headers():
+    """DSM binds the sharing_sid session to the client IP it saw on the
+    page's initial load (X-Real-IP/X-Forwarded-For) and rejects the
+    subject-fetch call with error 150 if the IP doesn't match - confirmed
+    by reproducing that exact failure and fix against the live backend.
+    So we must forward the SAME client-IP headers the initial request
+    carried, not just the cookie."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"success": True, "data": {"subject": "X"}}
+
+    client_headers = {"X-Real-IP": "192.168.1.1", "X-Forwarded-For": "192.168.1.1"}
+    with patch("app.requests.post", return_value=mock_response) as mock_post:
+        app_module.fetch_request_subject(
+            "REQ123", cookies={"sharing_sid": "abc123"}, extra_headers=client_headers
+        )
+
+    kwargs = mock_post.call_args.kwargs
+    assert kwargs["headers"]["X-Real-IP"] == "192.168.1.1"
+    assert kwargs["headers"]["X-Forwarded-For"] == "192.168.1.1"
+    assert kwargs["headers"]["x-syno-sharing"] == "REQ123"  # still present alongside
+
+
 def _assert_generic_title_preserved(fixed: bytes):
     """Shared assertion for the "title lookup didn't succeed" tests. Only
     checks the title-related tags - og:url/og:image are separate, correctly
@@ -209,9 +242,17 @@ def test_proxy_forwards_sharing_sid_cookie_from_initial_response():
 
     with patch("app.requests.request", return_value=initial_resp):
         with patch("app.requests.post", return_value=subject_resp) as mock_post:
-            resp = client.get("/mo/request/REQ123")
+            resp = client.get(
+                "/mo/request/REQ123",
+                headers={"X-Real-IP": "203.0.113.5", "X-Forwarded-For": "203.0.113.5"},
+            )
 
     assert mock_post.call_args.kwargs["cookies"] == {"sharing_sid": "real-cookie-value"}
+    # the same client-IP headers the initial request carried must also
+    # reach the subject-fetch call, or DSM rejects it (error 150).
+    sent_headers = mock_post.call_args.kwargs["headers"]
+    assert header(sent_headers, "X-Real-IP") == "203.0.113.5"
+    assert header(sent_headers, "X-Forwarded-For") == "203.0.113.5"
     soup = BeautifulSoup(resp.data, "html.parser")
     assert soup.title.string == "Real Subject | Synology Photos"
 

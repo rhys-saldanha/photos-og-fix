@@ -85,20 +85,27 @@ def add_og_url_if_missing(soup: BeautifulSoup, page_url: str) -> bool:
     return True
 
 
-def fetch_request_subject(request_id: str, cookies: dict | None) -> str | None:
+def fetch_request_subject(
+    request_id: str, cookies: dict | None, extra_headers: dict | None = None
+) -> str | None:
     """Look up the real subject of a Photo Request by its share ID.
 
     Reverse-engineered against the live DSM backend (not documented
-    anywhere): this call only succeeds with all three of:
+    anywhere): this call only succeeds with all of:
       - the /mo/request/webapi/... path prefix (bare /webapi/... fails)
       - an X-Syno-Sharing header naming the share ID
       - the sharing_sid cookie set by the initial page load
+      - the SAME client-IP headers (X-Real-IP/X-Forwarded-For) that the
+        initial page load carried - DSM binds the session to that IP and
+        rejects a mismatch with error 150, confirmed by reproducing that
+        exact failure and fix against the live backend
     Missing any one of these makes DSM return success=false. Returns None
     on any failure - callers must treat None as "leave it alone"."""
     try:
+        headers = {"x-syno-sharing": request_id, **(extra_headers or {})}
         resp = requests.post(
             f"{BACKEND}/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase",
-            headers={"x-syno-sharing": request_id},
+            headers=headers,
             cookies=cookies,
             data={
                 "api": "SYNO.Foto.Sharing.Passphrase",
@@ -110,12 +117,6 @@ def fetch_request_subject(request_id: str, cookies: dict | None) -> str | None:
         )
         payload = resp.json()
         if not payload.get("success"):
-            logging.info(
-                "subject lookup for %s returned: %s (sent cookies=%s)",
-                request_id,
-                payload,
-                cookies,
-            )
             return None
         return payload.get("data", {}).get("subject") or None
     except Exception:
@@ -168,7 +169,12 @@ def validate_html(
         )
 
 
-def fix_og_tags(html_bytes: bytes, page_url: str, cookies: dict | None = None) -> bytes:
+def fix_og_tags(
+    html_bytes: bytes,
+    page_url: str,
+    cookies: dict | None = None,
+    extra_headers: dict | None = None,
+) -> bytes:
     """Top-level entry point. Never raises - on any failure, returns the
     original bytes unchanged and logs why."""
     try:
@@ -182,7 +188,7 @@ def fix_og_tags(html_bytes: bytes, page_url: str, cookies: dict | None = None) -
         request_match = REQUEST_PATH_RE.match(urlparse(page_url).path)
         title_changed = False
         if request_match:
-            subject = fetch_request_subject(request_match.group(1), cookies)
+            subject = fetch_request_subject(request_match.group(1), cookies, extra_headers)
             if subject:
                 new_title = f"{subject} | Synology Photos"
                 title_changed = replace_generic_request_title(soup, subject)
@@ -221,7 +227,15 @@ def proxy(path):
     body = resp.content
     content_type = resp.headers.get("Content-Type", "")
     if request.method == "GET" and "text/html" in content_type:
-        body = fix_og_tags(body, request.url, cookies=resp.cookies.get_dict())
+        # DSM's synofoto backend binds Photo Request sessions to the
+        # client IP it saw - any follow-up call (see fetch_request_subject)
+        # must present the exact same X-Real-IP/X-Forwarded-For.
+        client_ip_headers = {
+            k: v for k, v in forward_headers.items() if k.lower() in ("x-real-ip", "x-forwarded-for")
+        }
+        body = fix_og_tags(
+            body, request.url, cookies=resp.cookies.get_dict(), extra_headers=client_ip_headers
+        )
 
     response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP]
     return Response(body, status=resp.status_code, headers=response_headers)
