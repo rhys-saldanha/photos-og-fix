@@ -110,6 +110,7 @@ def fetch_request_subject(request_id: str, cookies: dict | None) -> str | None:
         )
         payload = resp.json()
         if not payload.get("success"):
+            logging.info("subject lookup for %s returned: %s", request_id, payload)
             return None
         return payload.get("data", {}).get("subject") or None
     except Exception:
