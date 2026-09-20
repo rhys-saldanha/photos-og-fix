@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 from bs4 import BeautifulSoup
 
 import app as app_module
-from app import fix_og_tags
+from app import GENERIC_REQUEST_TITLE, fix_og_tags
 
 
 def og_content(html_bytes: bytes, property_name: str):
@@ -37,6 +37,28 @@ NO_HEAD_HTML = b"<html><body>broken page, no head at all</body></html>"
 
 NO_OG_TAGS_HTML = b"""<!DOCTYPE html><html><head>
 <title>Generic Photo Request Page</title>
+</head><body><div id="reactRoot"></div></body></html>"""
+
+REQUEST_PAGE_URL = "https://photos.example.com/mo/request/REQ123"
+
+GENERIC_REQUEST_HTML = b"""<!DOCTYPE html><html><head>
+<title>Synology Photos</title>
+<meta property="og:title" content="Synology Photos" />
+<meta property="og:image" content="webman/3rdparty/SynologyPhotos/images/icon/photos_512.png" />
+</head><body><div id="reactRoot"></div></body></html>"""
+
+# Same generic page, but without a fixable relative og:image - used for the
+# "subject lookup failed/skipped" tests, so a full-equality assertion tests
+# only the title behavior and isn't muddied by the (correct, independent)
+# image-fixing behavior also firing on GENERIC_REQUEST_HTML.
+GENERIC_REQUEST_HTML_NO_IMAGE = b"""<!DOCTYPE html><html><head>
+<title>Synology Photos</title>
+<meta property="og:title" content="Synology Photos" />
+</head><body><div id="reactRoot"></div></body></html>"""
+
+NON_GENERIC_TITLE_REQUEST_HTML = b"""<!DOCTYPE html><html><head>
+<title>Something Else Entirely</title>
+<meta property="og:title" content="Something Else Entirely" />
 </head><body><div id="reactRoot"></div></body></html>"""
 
 
@@ -71,6 +93,78 @@ def test_missing_head_leaves_original_untouched():
 def test_no_og_tags_leaves_original_untouched():
     fixed = fix_og_tags(NO_OG_TAGS_HTML, PAGE_URL)
     assert fixed == NO_OG_TAGS_HTML
+
+
+def test_request_page_title_replaced_with_real_subject():
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "success": True,
+        "data": {"subject": "Karishma & Ankush Wedding"},
+    }
+    with patch("app.requests.post", return_value=mock_response) as mock_post:
+        fixed = fix_og_tags(GENERIC_REQUEST_HTML, REQUEST_PAGE_URL)
+
+    mock_post.assert_called_once()
+    soup = BeautifulSoup(fixed, "html.parser")
+    assert soup.title.string == "Karishma & Ankush Wedding | Synology Photos"
+    assert (
+        og_content(fixed, "og:title") == "Karishma & Ankush Wedding | Synology Photos"
+    )
+
+
+def _assert_generic_title_preserved(fixed: bytes):
+    """Shared assertion for the "title lookup didn't succeed" tests. Only
+    checks the title-related tags - og:url/og:image are separate, correctly
+    independent behaviors and shouldn't be conflated with this check."""
+    soup = BeautifulSoup(fixed, "html.parser")
+    assert soup.title.string == GENERIC_REQUEST_TITLE
+    assert og_content(fixed, "og:title") == GENERIC_REQUEST_TITLE
+
+
+def test_request_page_title_untouched_when_api_call_fails():
+    with patch("app.requests.post", side_effect=ConnectionError("boom")):
+        fixed = fix_og_tags(GENERIC_REQUEST_HTML_NO_IMAGE, REQUEST_PAGE_URL)
+    _assert_generic_title_preserved(fixed)
+
+
+def test_request_page_title_untouched_when_api_reports_failure():
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"success": False}
+    with patch("app.requests.post", return_value=mock_response):
+        fixed = fix_og_tags(GENERIC_REQUEST_HTML_NO_IMAGE, REQUEST_PAGE_URL)
+    _assert_generic_title_preserved(fixed)
+
+
+def test_request_page_title_untouched_when_subject_missing():
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"success": True, "data": {}}
+    with patch("app.requests.post", return_value=mock_response):
+        fixed = fix_og_tags(GENERIC_REQUEST_HTML_NO_IMAGE, REQUEST_PAGE_URL)
+    _assert_generic_title_preserved(fixed)
+
+
+def test_request_page_title_never_overwrites_non_generic_title():
+    """Defensive: only ever replace the exact known generic title. If a
+    future DSM version puts something else there, don't touch it - we
+    don't understand it well enough to safely overwrite it."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "success": True,
+        "data": {"subject": "Some Subject"},
+    }
+    with patch("app.requests.post", return_value=mock_response):
+        fixed = fix_og_tags(NON_GENERIC_TITLE_REQUEST_HTML, REQUEST_PAGE_URL)
+    soup = BeautifulSoup(fixed, "html.parser")
+    assert soup.title.string == "Something Else Entirely"
+    assert og_content(fixed, "og:title") == "Something Else Entirely"
+
+
+def test_sharing_pages_never_trigger_request_subject_lookup():
+    """/mo/sharing/ pages already carry correct title data - the extra
+    API call is only relevant for /mo/request/ pages."""
+    with patch("app.requests.post") as mock_post:
+        fix_og_tags(RELATIVE_IMAGE_HTML, PAGE_URL)
+    mock_post.assert_not_called()
 
 
 def test_proxy_trusts_forwarded_proto_and_host():

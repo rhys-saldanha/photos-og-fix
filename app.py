@@ -10,7 +10,7 @@ breaks - at worst it just fails to improve the preview.
 """
 import logging
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,6 +20,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 BACKEND = "http://127.0.0.1:5000"
 REQUEST_TIMEOUT = 15
 MIN_SIZE_RATIO = 0.5  # modified output must be at least this fraction of the original size
+
+# Photo Request pages (as opposed to album sharing pages) always render a
+# generic title/icon regardless of the request's actual subject - but the
+# real subject is available via an unauthenticated API call keyed by the
+# share ID in the URL, since these pages are meant to be used by people
+# with no DSM account at all.
+REQUEST_PATH_RE = re.compile(r"^/mo/request/([^/]+)/?$")
+GENERIC_REQUEST_TITLE = "Synology Photos"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +85,55 @@ def add_og_url_if_missing(soup: BeautifulSoup, page_url: str) -> bool:
     return True
 
 
-def validate_html(soup: BeautifulSoup, expect_og_url: bool, original_len: int) -> None:
+def fetch_request_subject(request_id: str) -> str | None:
+    """Look up the real subject of a Photo Request by its share ID. Returns
+    None on any failure - network error, non-2xx, unexpected JSON shape,
+    or a missing subject - callers must treat None as "leave it alone"."""
+    try:
+        resp = requests.post(
+            f"{BACKEND}/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase",
+            data={
+                "api": "SYNO.Foto.Sharing.Passphrase",
+                "method": "get_photo_request_info",
+                "version": "1",
+                "passphrase": f'"{request_id}"',
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        payload = resp.json()
+        if not payload.get("success"):
+            return None
+        return payload.get("data", {}).get("subject") or None
+    except Exception:
+        logging.exception("failed to fetch photo request subject for %s", request_id)
+        return None
+
+
+def replace_generic_request_title(soup: BeautifulSoup, subject: str) -> bool:
+    """Replace the generic title/og:title with the request's real subject,
+    but only if both are EXACTLY the known generic value first (assert
+    before overwrite) - never touch a title we don't recognize."""
+    head = soup.head
+    if head is None:
+        raise ValueError("no <head> element")
+
+    title_tag = head.find("title")
+    og_title = head.find("meta", attrs={"property": "og:title"})
+
+    if title_tag is None or title_tag.string != GENERIC_REQUEST_TITLE:
+        return False
+    if og_title is None or og_title.get("content") != GENERIC_REQUEST_TITLE:
+        return False
+
+    new_title = f"{subject} | Synology Photos"
+    title_tag.string = new_title
+    og_title["content"] = new_title
+    return True
+
+
+def validate_html(
+    soup: BeautifulSoup, expect_og_url: bool, original_len: int, expect_title: str | None = None
+) -> None:
     """Sanity-check the modified document before it's allowed out the door.
     Raises on anything that looks like corruption; callers must treat any
     exception as "discard the modification"."""
@@ -85,6 +141,12 @@ def validate_html(soup: BeautifulSoup, expect_og_url: bool, original_len: int) -
         raise ValueError("missing html/head/body after modification")
     if expect_og_url and soup.head.find("meta", attrs={"property": "og:url"}) is None:
         raise ValueError("og:url missing after insertion")
+    if expect_title is not None:
+        if soup.title is None or soup.title.string != expect_title:
+            raise ValueError("title was not updated as expected")
+        og_title = soup.head.find("meta", attrs={"property": "og:title"})
+        if og_title is None or og_title.get("content") != expect_title:
+            raise ValueError("og:title was not updated as expected")
     rendered_len = len(str(soup))
     if rendered_len < original_len * MIN_SIZE_RATIO:
         raise ValueError(
@@ -102,10 +164,24 @@ def fix_og_tags(html_bytes: bytes, page_url: str) -> bytes:
         image_changed = absolutize_og_image(soup, page_url)
         url_added = add_og_url_if_missing(soup, page_url)
 
-        if not (image_changed or url_added):
+        new_title = None
+        request_match = REQUEST_PATH_RE.match(urlparse(page_url).path)
+        title_changed = False
+        if request_match:
+            subject = fetch_request_subject(request_match.group(1))
+            if subject:
+                new_title = f"{subject} | Synology Photos"
+                title_changed = replace_generic_request_title(soup, subject)
+
+        if not (image_changed or url_added or title_changed):
             return html_bytes
 
-        validate_html(soup, expect_og_url=url_added, original_len=len(html))
+        validate_html(
+            soup,
+            expect_og_url=url_added,
+            original_len=len(html),
+            expect_title=new_title if title_changed else None,
+        )
         return str(soup).encode("utf-8")
 
     except Exception:
