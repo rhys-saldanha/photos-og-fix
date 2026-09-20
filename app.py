@@ -27,7 +27,10 @@ MIN_SIZE_RATIO = 0.5  # modified output must be at least this fraction of the or
 # share ID in the URL, since these pages are meant to be used by people
 # with no DSM account at all.
 REQUEST_PATH_RE = re.compile(r"^/mo/request/([^/]+)/?$")
-GENERIC_REQUEST_TITLE = "Synology Photos"
+# Synology renders this with a non-breaking space (U+00A0), not a regular
+# one - confirmed against the live page source. An exact-match comparison
+# using a normal space here silently never matches.
+GENERIC_REQUEST_TITLE = "Synology\xa0Photos"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,13 +120,6 @@ def fetch_request_subject(
         )
         payload = resp.json()
         if not payload.get("success"):
-            logging.info(
-                "subject lookup for %s returned: %s (headers sent=%s, cookies sent=%s)",
-                request_id,
-                payload,
-                headers,
-                cookies,
-            )
             return None
         return payload.get("data", {}).get("subject") or None
     except Exception:
@@ -192,20 +188,10 @@ def fix_og_tags(
         url_added = add_og_url_if_missing(soup, page_url)
 
         new_title = None
-        parsed_path = urlparse(page_url).path
-        request_match = REQUEST_PATH_RE.match(parsed_path)
-        logging.info("path=%r matched=%s cookies=%s", parsed_path, bool(request_match), cookies)
+        request_match = REQUEST_PATH_RE.match(urlparse(page_url).path)
         title_changed = False
         if request_match:
             subject = fetch_request_subject(request_match.group(1), cookies, extra_headers)
-            logging.info(
-                "subject=%r title_tag=%r og_title_content=%r",
-                subject,
-                soup.head.find("title").string if soup.head and soup.head.find("title") else None,
-                (soup.head.find("meta", attrs={"property": "og:title"}) or {}).get("content")
-                if soup.head
-                else None,
-            )
             if subject:
                 new_title = f"{subject} | Synology Photos"
                 title_changed = replace_generic_request_title(soup, subject)

@@ -52,20 +52,23 @@ NO_OG_TAGS_HTML = b"""<!DOCTYPE html><html><head>
 
 REQUEST_PAGE_URL = "https://photos.example.com/mo/request/REQ123"
 
-GENERIC_REQUEST_HTML = b"""<!DOCTYPE html><html><head>
-<title>Synology Photos</title>
-<meta property="og:title" content="Synology Photos" />
+# Synology renders the generic title with a non-breaking space (U+00A0),
+# not a regular one - the fixtures below must match that exactly, since
+# that's precisely the mismatch that silently broke this in production.
+GENERIC_REQUEST_HTML = f"""<!DOCTYPE html><html><head>
+<title>Synology\xa0Photos</title>
+<meta property="og:title" content="Synology\xa0Photos" />
 <meta property="og:image" content="webman/3rdparty/SynologyPhotos/images/icon/photos_512.png" />
-</head><body><div id="reactRoot"></div></body></html>"""
+</head><body><div id="reactRoot"></div></body></html>""".encode("utf-8")
 
 # Same generic page, but without a fixable relative og:image - used for the
 # "subject lookup failed/skipped" tests, so a full-equality assertion tests
 # only the title behavior and isn't muddied by the (correct, independent)
 # image-fixing behavior also firing on GENERIC_REQUEST_HTML.
-GENERIC_REQUEST_HTML_NO_IMAGE = b"""<!DOCTYPE html><html><head>
-<title>Synology Photos</title>
-<meta property="og:title" content="Synology Photos" />
-</head><body><div id="reactRoot"></div></body></html>"""
+GENERIC_REQUEST_HTML_NO_IMAGE = f"""<!DOCTYPE html><html><head>
+<title>Synology\xa0Photos</title>
+<meta property="og:title" content="Synology\xa0Photos" />
+</head><body><div id="reactRoot"></div></body></html>""".encode("utf-8")
 
 NON_GENERIC_TITLE_REQUEST_HTML = b"""<!DOCTYPE html><html><head>
 <title>Something Else Entirely</title>
