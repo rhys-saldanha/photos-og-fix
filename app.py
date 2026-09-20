@@ -117,6 +117,13 @@ def fetch_request_subject(
         )
         payload = resp.json()
         if not payload.get("success"):
+            logging.info(
+                "subject lookup for %s returned: %s (headers sent=%s, cookies sent=%s)",
+                request_id,
+                payload,
+                headers,
+                cookies,
+            )
             return None
         return payload.get("data", {}).get("subject") or None
     except Exception:
