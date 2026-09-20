@@ -85,13 +85,21 @@ def add_og_url_if_missing(soup: BeautifulSoup, page_url: str) -> bool:
     return True
 
 
-def fetch_request_subject(request_id: str) -> str | None:
-    """Look up the real subject of a Photo Request by its share ID. Returns
-    None on any failure - network error, non-2xx, unexpected JSON shape,
-    or a missing subject - callers must treat None as "leave it alone"."""
+def fetch_request_subject(request_id: str, cookies: dict | None) -> str | None:
+    """Look up the real subject of a Photo Request by its share ID.
+
+    Reverse-engineered against the live DSM backend (not documented
+    anywhere): this call only succeeds with all three of:
+      - the /mo/request/webapi/... path prefix (bare /webapi/... fails)
+      - an X-Syno-Sharing header naming the share ID
+      - the sharing_sid cookie set by the initial page load
+    Missing any one of these makes DSM return success=false. Returns None
+    on any failure - callers must treat None as "leave it alone"."""
     try:
         resp = requests.post(
-            f"{BACKEND}/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase",
+            f"{BACKEND}/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase",
+            headers={"x-syno-sharing": request_id},
+            cookies=cookies,
             data={
                 "api": "SYNO.Foto.Sharing.Passphrase",
                 "method": "get_photo_request_info",
@@ -154,7 +162,7 @@ def validate_html(
         )
 
 
-def fix_og_tags(html_bytes: bytes, page_url: str) -> bytes:
+def fix_og_tags(html_bytes: bytes, page_url: str, cookies: dict | None = None) -> bytes:
     """Top-level entry point. Never raises - on any failure, returns the
     original bytes unchanged and logs why."""
     try:
@@ -168,7 +176,7 @@ def fix_og_tags(html_bytes: bytes, page_url: str) -> bytes:
         request_match = REQUEST_PATH_RE.match(urlparse(page_url).path)
         title_changed = False
         if request_match:
-            subject = fetch_request_subject(request_match.group(1))
+            subject = fetch_request_subject(request_match.group(1), cookies)
             if subject:
                 new_title = f"{subject} | Synology Photos"
                 title_changed = replace_generic_request_title(soup, subject)
@@ -207,7 +215,7 @@ def proxy(path):
     body = resp.content
     content_type = resp.headers.get("Content-Type", "")
     if request.method == "GET" and "text/html" in content_type:
-        body = fix_og_tags(body, request.url)
+        body = fix_og_tags(body, request.url, cookies=resp.cookies.get_dict())
 
     response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP]
     return Response(body, status=resp.status_code, headers=response_headers)

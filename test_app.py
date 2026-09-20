@@ -102,7 +102,9 @@ def test_request_page_title_replaced_with_real_subject():
         "data": {"subject": "Karishma & Ankush Wedding"},
     }
     with patch("app.requests.post", return_value=mock_response) as mock_post:
-        fixed = fix_og_tags(GENERIC_REQUEST_HTML, REQUEST_PAGE_URL)
+        fixed = fix_og_tags(
+            GENERIC_REQUEST_HTML, REQUEST_PAGE_URL, cookies={"sharing_sid": "abc123"}
+        )
 
     mock_post.assert_called_once()
     soup = BeautifulSoup(fixed, "html.parser")
@@ -110,6 +112,28 @@ def test_request_page_title_replaced_with_real_subject():
     assert (
         og_content(fixed, "og:title") == "Karishma & Ankush Wedding | Synology Photos"
     )
+
+
+def test_request_subject_fetch_uses_the_undocumented_required_recipe():
+    """Reverse-engineered against the real DSM backend: this API only
+    works with (a) the /mo/request/webapi/... path prefix - the bare
+    /webapi/... path fails, (b) an x-syno-sharing header naming the share
+    ID, and (c) the sharing_sid cookie set by the initial page load. All
+    three were confirmed missing/wrong independently via manual curl
+    testing against the live backend before landing on this combination."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"success": True, "data": {"subject": "X"}}
+
+    with patch("app.requests.post", return_value=mock_response) as mock_post:
+        app_module.fetch_request_subject("REQ123", cookies={"sharing_sid": "abc123"})
+
+    mock_post.assert_called_once()
+    _, kwargs = mock_post.call_args
+    call_url = mock_post.call_args[0][0]
+    assert call_url.endswith("/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase")
+    assert kwargs["headers"]["x-syno-sharing"] == "REQ123"
+    assert kwargs["cookies"] == {"sharing_sid": "abc123"}
+    assert kwargs["data"]["passphrase"] == '"REQ123"'
 
 
 def _assert_generic_title_preserved(fixed: bytes):
@@ -165,6 +189,31 @@ def test_sharing_pages_never_trigger_request_subject_lookup():
     with patch("app.requests.post") as mock_post:
         fix_og_tags(RELATIVE_IMAGE_HTML, PAGE_URL)
     mock_post.assert_not_called()
+
+
+def test_proxy_forwards_sharing_sid_cookie_from_initial_response():
+    """The critical wiring: the sharing_sid cookie comes from the SAME
+    initial backend response we're already fixing the HTML of - it must
+    be extracted from there and threaded through to the subject-fetch
+    call, not fetched separately."""
+    client = app_module.app.test_client()
+
+    initial_resp = MagicMock()
+    initial_resp.status_code = 200
+    initial_resp.headers = {"Content-Type": "text/html"}
+    initial_resp.content = GENERIC_REQUEST_HTML_NO_IMAGE
+    initial_resp.cookies.get_dict.return_value = {"sharing_sid": "real-cookie-value"}
+
+    subject_resp = MagicMock()
+    subject_resp.json.return_value = {"success": True, "data": {"subject": "Real Subject"}}
+
+    with patch("app.requests.request", return_value=initial_resp):
+        with patch("app.requests.post", return_value=subject_resp) as mock_post:
+            resp = client.get("/mo/request/REQ123")
+
+    assert mock_post.call_args.kwargs["cookies"] == {"sharing_sid": "real-cookie-value"}
+    soup = BeautifulSoup(resp.data, "html.parser")
+    assert soup.title.string == "Real Subject | Synology Photos"
 
 
 def test_proxy_trusts_forwarded_proto_and_host():
