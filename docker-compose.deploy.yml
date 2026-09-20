@@ -1,0 +1,8 @@
+services:
+  photos-og-fix:
+    image: ghcr.io/rhys-saldanha/photos-og-fix:latest
+    # host networking: this proxy talks to DSM's own Photos backend at
+    # 127.0.0.1:5000 on the NAS itself, which only works if the container
+    # shares the host's network namespace rather than a bridge network.
+    network_mode: host
+    restart: unless-stopped
