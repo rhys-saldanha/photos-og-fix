@@ -75,6 +75,12 @@ NON_GENERIC_TITLE_REQUEST_HTML = b"""<!DOCTYPE html><html><head>
 <meta property="og:title" content="Something Else Entirely" />
 </head><body><div id="reactRoot"></div></body></html>"""
 
+NON_GENERIC_IMAGE_REQUEST_HTML = f"""<!DOCTYPE html><html><head>
+<title>Synology\xa0Photos</title>
+<meta property="og:title" content="Synology\xa0Photos" />
+<meta property="og:image" content="https://photos.example.com/some/other/real-photo.jpg" />
+</head><body><div id="reactRoot"></div></body></html>""".encode("utf-8")
+
 
 def test_relative_image_becomes_absolute():
     fixed = fix_og_tags(RELATIVE_IMAGE_HTML, PAGE_URL)
@@ -128,7 +134,7 @@ def test_request_page_title_replaced_with_real_subject():
     )
 
 
-def test_request_subject_fetch_uses_the_undocumented_required_recipe():
+def test_request_info_fetch_uses_the_undocumented_required_recipe():
     """Reverse-engineered against the real DSM backend: this API only
     works with (a) the /mo/request/webapi/... path prefix - the bare
     /webapi/... path fails, (b) an x-syno-sharing header naming the share
@@ -139,7 +145,7 @@ def test_request_subject_fetch_uses_the_undocumented_required_recipe():
     mock_response.json.return_value = {"success": True, "data": {"subject": "X"}}
 
     with patch("app.requests.post", return_value=mock_response) as mock_post:
-        app_module.fetch_request_subject("REQ123", cookies={"sharing_sid": "abc123"})
+        app_module.fetch_request_info("REQ123", cookies={"sharing_sid": "abc123"})
 
     mock_post.assert_called_once()
     _, kwargs = mock_post.call_args
@@ -150,10 +156,10 @@ def test_request_subject_fetch_uses_the_undocumented_required_recipe():
     assert kwargs["data"]["passphrase"] == '"REQ123"'
 
 
-def test_request_subject_fetch_forwards_client_ip_headers():
+def test_request_info_fetch_forwards_client_ip_headers():
     """DSM binds the sharing_sid session to the client IP it saw on the
     page's initial load (X-Real-IP/X-Forwarded-For) and rejects the
-    subject-fetch call with error 150 if the IP doesn't match - confirmed
+    info-fetch call with error 150 if the IP doesn't match - confirmed
     by reproducing that exact failure and fix against the live backend.
     So we must forward the SAME client-IP headers the initial request
     carried, not just the cookie."""
@@ -162,7 +168,7 @@ def test_request_subject_fetch_forwards_client_ip_headers():
 
     client_headers = {"X-Real-IP": "192.168.1.1", "X-Forwarded-For": "192.168.1.1"}
     with patch("app.requests.post", return_value=mock_response) as mock_post:
-        app_module.fetch_request_subject(
+        app_module.fetch_request_info(
             "REQ123", cookies={"sharing_sid": "abc123"}, extra_headers=client_headers
         )
 
@@ -217,6 +223,72 @@ def test_request_page_title_never_overwrites_non_generic_title():
     soup = BeautifulSoup(fixed, "html.parser")
     assert soup.title.string == "Something Else Entirely"
     assert og_content(fixed, "og:title") == "Something Else Entirely"
+
+
+def test_extract_album_share_id_parses_quickconnect_link():
+    assert (
+        app_module.extract_album_share_id(
+            "https://rhys-saldanha.quickconnect.to/mo/sharing/KrYBkLIsS"
+        )
+        == "KrYBkLIsS"
+    )
+
+
+def test_extract_album_share_id_rejects_malformed_links():
+    assert app_module.extract_album_share_id("") is None
+    assert app_module.extract_album_share_id("not-a-link") is None
+    assert app_module.extract_album_share_id("https://example.com/mo/sharing/") is None
+
+
+def test_request_page_og_image_swapped_to_album_cover():
+    """When the request's album_sharing_link is present, the generic icon in
+    og:image gets replaced with <visitor-base>/mo/sharing/<album_id>/cover.jpg
+    - the album's real cover photo, built from the visitor's own base URL
+    (never the quickconnect.to host that appears in the API payload)."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "success": True,
+        "data": {
+            "subject": "Karishma & Ankush Wedding",
+            "album_sharing_link": "https://rhys-saldanha.quickconnect.to/mo/sharing/KrYBkLIsS",
+        },
+    }
+    with patch("app.requests.post", return_value=mock_response):
+        fixed = fix_og_tags(GENERIC_REQUEST_HTML, REQUEST_PAGE_URL)
+    assert (
+        og_content(fixed, "og:image") == "https://photos.example.com/mo/sharing/KrYBkLIsS/cover.jpg"
+    )
+
+
+def test_request_page_without_album_keeps_generic_icon():
+    """Not every Photo Request uploads to an album - without an
+    album_sharing_link, leave the (absolutized) generic icon alone rather
+    than guess at a cover URL."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"success": True, "data": {"subject": "Some Subject"}}
+    with patch("app.requests.post", return_value=mock_response):
+        fixed = fix_og_tags(GENERIC_REQUEST_HTML, REQUEST_PAGE_URL)
+    assert (
+        og_content(fixed, "og:image")
+        == "https://photos.example.com/mo/request/webman/3rdparty/SynologyPhotos/images/icon/photos_512.png"
+    )
+
+
+def test_request_page_real_image_never_replaced():
+    """The cover swap must only fire for the exact known generic icon - a
+    page carrying a genuine custom og:image keeps it, even when the request
+    has an album."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "success": True,
+        "data": {
+            "subject": "W",
+            "album_sharing_link": "https://rhys-saldanha.quickconnect.to/mo/sharing/KrYBkLIsS",
+        },
+    }
+    with patch("app.requests.post", return_value=mock_response):
+        fixed = fix_og_tags(NON_GENERIC_IMAGE_REQUEST_HTML, REQUEST_PAGE_URL)
+    assert og_content(fixed, "og:image") == "https://photos.example.com/some/other/real-photo.jpg"
 
 
 def test_sharing_pages_never_trigger_request_subject_lookup():

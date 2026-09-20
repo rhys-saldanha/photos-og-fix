@@ -31,6 +31,14 @@ REQUEST_PATH_RE = re.compile(r"^/mo/request/([^/]+)/?$")
 # one - confirmed against the live page source. An exact-match comparison
 # using a normal space here silently never matches.
 GENERIC_REQUEST_TITLE = "Synology\xa0Photos"
+# Photo Request pages always use this exact icon in og:image (relative), on
+# every DSM version we've seen. The path check below tolerates both the raw
+# relative form and the absolufied version we wrote earlier in the pipeline.
+GENERIC_IMAGE_PATH = "webman/3rdparty/SynologyPhotos/images/icon/photos_512.png"
+# Payload gives album_sharing_link like
+# https://rhys-saldanha.quickconnect.to/mo/sharing/KrYBkLIsS - we only need
+# the trailing share ID, which doubles as the album ID for the cover URL.
+ALBUM_SHARING_LINK_RE = re.compile(r"/mo/sharing/([^/]+)")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,10 +96,11 @@ def add_og_url_if_missing(soup: BeautifulSoup, page_url: str) -> bool:
     return True
 
 
-def fetch_request_subject(
+def fetch_request_info(
     request_id: str, cookies: dict | None, extra_headers: dict | None = None
-) -> str | None:
-    """Look up the real subject of a Photo Request by its share ID.
+) -> dict | None:
+    """Look up the real info of a Photo Request (subject, and - when it
+    uploads into one - its album's sharing link) by its share ID.
 
     Reverse-engineered against the live DSM backend (not documented
     anywhere): this call only succeeds with all of:
@@ -121,10 +130,18 @@ def fetch_request_subject(
         payload = resp.json()
         if not payload.get("success"):
             return None
-        return payload.get("data", {}).get("subject") or None
+        return payload.get("data") or None
     except Exception:
-        logging.exception("failed to fetch photo request subject for %s", request_id)
+        logging.exception("failed to fetch photo request info for %s", request_id)
         return None
+
+
+def extract_album_share_id(album_sharing_link: str) -> str | None:
+    """Pull the album/share ID out of an album_sharing_link like
+    https://rhys-saldanha.quickconnect.to/mo/sharing/KrYBkLIsS - or return
+    None if it doesn't look like the link shape DSM actually emits."""
+    match = ALBUM_SHARING_LINK_RE.search(album_sharing_link)
+    return match.group(1) if match else None
 
 
 def replace_generic_request_title(soup: BeautifulSoup, subject: str) -> bool:
@@ -146,6 +163,29 @@ def replace_generic_request_title(soup: BeautifulSoup, subject: str) -> bool:
     new_title = f"{subject} | Synology Photos"
     title_tag.string = new_title
     og_title["content"] = new_title
+    return True
+
+
+def use_album_cover_if_generic(soup: BeautifulSoup, page_url: str, album_id: str) -> bool:
+    """Replace the generic photos_512.png og:image with the album's cover
+    photo (which lives at /mo/sharing/<album_id>/cover.jpg on the same
+    DSM install), but ONLY when the current image is exactly that known
+    generic icon - never overwrite a page that already has a real image.
+    The cover URL is built from the visitor's own base (the same absolute
+    origin that absolutize_og_image uses), not the quickconnect.to host
+    that happens to appear in the API payload."""
+    head = soup.head
+    if head is None:
+        raise ValueError("no <head> element")
+
+    og_image = head.find("meta", attrs={"property": "og:image"})
+    if og_image is None or not og_image.get("content"):
+        return False
+
+    if not urlparse(og_image["content"]).path.endswith(GENERIC_IMAGE_PATH):
+        return False  # not the generic icon, leave any real image alone
+
+    og_image["content"] = urljoin(page_url, f"/mo/sharing/{album_id}/cover.jpg")
     return True
 
 
@@ -190,13 +230,19 @@ def fix_og_tags(
         new_title = None
         request_match = REQUEST_PATH_RE.match(urlparse(page_url).path)
         title_changed = False
+        image_replaced = False
         if request_match:
-            subject = fetch_request_subject(request_match.group(1), cookies, extra_headers)
-            if subject:
-                new_title = f"{subject} | Synology Photos"
-                title_changed = replace_generic_request_title(soup, subject)
+            info = fetch_request_info(request_match.group(1), cookies, extra_headers)
+            if info:
+                subject = info.get("subject")
+                if subject:
+                    new_title = f"{subject} | Synology Photos"
+                    title_changed = replace_generic_request_title(soup, subject)
+                album_id = extract_album_share_id(info.get("album_sharing_link") or "")
+                if album_id:
+                    image_replaced = use_album_cover_if_generic(soup, page_url, album_id)
 
-        if not (image_changed or url_added or title_changed):
+        if not (image_changed or url_added or title_changed or image_replaced):
             return html_bytes
 
         validate_html(
