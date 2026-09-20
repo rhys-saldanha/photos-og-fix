@@ -2,8 +2,11 @@
 Self-check for app.py's fix_og_tags(). No framework, no fixtures - just
 asserts. Run with: python3 test_app.py
 """
+from unittest.mock import MagicMock, patch
+
 from bs4 import BeautifulSoup
 
+import app as app_module
 from app import fix_og_tags
 
 
@@ -68,6 +71,33 @@ def test_missing_head_leaves_original_untouched():
 def test_no_og_tags_leaves_original_untouched():
     fixed = fix_og_tags(NO_OG_TAGS_HTML, PAGE_URL)
     assert fixed == NO_OG_TAGS_HTML
+
+
+def test_proxy_trusts_forwarded_proto_and_host():
+    """DSM's reverse proxy terminates TLS and forwards to us over plain
+    HTTP with X-Forwarded-Proto/X-Forwarded-Host set (confirmed against
+    the real nginx config). Without trusting those headers, absolutized
+    URLs would incorrectly come out as http://<internal-hostname>/... ."""
+    client = app_module.app.test_client()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"Content-Type": "text/html"}
+    mock_resp.content = RELATIVE_IMAGE_HTML
+
+    with patch("app.requests.request", return_value=mock_resp):
+        resp = client.get(
+            "/mo/sharing/ABC123",
+            headers={
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "photos.example.com",
+            },
+        )
+
+    assert (
+        og_content(resp.data, "og:image")
+        == "https://photos.example.com/mo/sharing/ABC123/cover.jpg"
+    )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 BACKEND = "http://127.0.0.1:5000"
 REQUEST_TIMEOUT = 15
@@ -26,6 +27,12 @@ logging.basicConfig(
 )
 
 app = Flask(__name__)
+# DSM's reverse proxy terminates TLS and forwards to us over plain HTTP,
+# setting X-Forwarded-Proto/X-Forwarded-Host (confirmed against its actual
+# nginx config). Without this, request.url would report our internal
+# http://localhost:8181 address instead of the real https:// URL a visitor
+# used - which is exactly the bug we're here to fix, just relocated.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 _HOP_BY_HOP = {"content-length", "transfer-encoding", "content-encoding", "connection"}
 
