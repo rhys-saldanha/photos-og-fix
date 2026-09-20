@@ -198,6 +198,14 @@ def fix_og_tags(
         title_changed = False
         if request_match:
             subject = fetch_request_subject(request_match.group(1), cookies, extra_headers)
+            logging.info(
+                "subject=%r title_tag=%r og_title_content=%r",
+                subject,
+                soup.head.find("title").string if soup.head and soup.head.find("title") else None,
+                (soup.head.find("meta", attrs={"property": "og:title"}) or {}).get("content")
+                if soup.head
+                else None,
+            )
             if subject:
                 new_title = f"{subject} | Synology Photos"
                 title_changed = replace_generic_request_title(soup, subject)
