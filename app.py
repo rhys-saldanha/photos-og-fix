@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-BACKEND = "http://127.0.0.1:5000"
+BACKEND = "http://127.0.0.1"
 # (connect, read) timeout for the forward to the DSM backend. Read timeout
 # deliberately None: this proxy buffers the entire upload body (get_data())
 # before forwarding, so this timeout only gates DSM's *processing* time
@@ -298,7 +298,10 @@ def fix_og_tags(
 @app.route("/<path:path>", methods=["GET", "HEAD", "POST"])
 def proxy(path):
     upstream_url = f"{BACKEND}/{path}"
-    forward_headers = {k: v for k, v in request.headers if k.lower() != "host"}
+    # Forward the original Host header so DSM's nginx routes by server_name
+    # to the fqdn app-portal vhost (which sets REWRITE_APP to boot the
+    # Photos app shell) instead of serving the generic portal shell.
+    forward_headers = dict(request.headers)
 
     try:
         resp = requests.request(
@@ -331,6 +334,9 @@ def proxy(path):
         client_ip_headers = {
             k: v for k, v in forward_headers.items() if k.lower() in ("x-real-ip", "x-forwarded-for")
         }
+        # fetch_request_info() calls BACKEND directly (not via this proxy), so
+        # it must carry the same Host header to hit the same app-portal vhost.
+        client_ip_headers["Host"] = request.headers.get("Host", "")
         body = fix_og_tags(
             body, request.url, cookies=resp.cookies.get_dict(), extra_headers=client_ip_headers
         )
