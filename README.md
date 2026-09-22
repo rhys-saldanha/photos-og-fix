@@ -38,16 +38,21 @@ a preview.
 
 ## A gotcha worth knowing: upstream timeout budget
 
-`REQUEST_TIMEOUT` in `app.py` (used when forwarding to the real DSM
-backend) is set to match DSM's own reverse-proxy timeouts exactly (60s -
-confirmed against `/usr/syno/etc/www/ReverseProxy.json` on the live NAS).
-Since this proxy sits *inside* that reverse proxy's timeout budget, a
-shorter value here makes this proxy a stricter bottleneck than DSM's own
-front door - large uploads (especially video, which DSM has to transcode/
-thumbnail server-side) that DSM would tolerate could time out here
-instead, surfacing to the uploader as a generic connection error. If you
-ever see failed-upload reports and suspect this, check for
-`status=504 body=proxy_error:...` lines in the request log first.
+`REQUEST_TIMEOUT` in `app.py` is a `(connect, read)` timeout for the
+forward to the DSM backend, with the read timeout set to **None** (no
+limit). The proxy buffers the entire request body (`get_data()`) before
+forwarding, so any timeout here only gates DSM's own processing time after
+the upload has fully arrived. The browser-facing timeout authority is the
+outer DSMy reverse proxy (`/usr/syno/etc/www/ReverseProxy.json`,
+confirmed live on the NAS: `proxy_read_timeout` / `proxy_send_timeout` /
+`client_body_timeout` are all 60s) - it's what actually arbitrates a hung
+or slow backend. This proxy must never impose a stricter bound than the
+platform it sits inside of, so the read timeout stays off. (It was
+previously 15s, then 60s, which could kill large/slow uploads DSM would
+have tolerated, surfacing as a generic connection error.) A fast-fail
+connect timeout (5s) remains so a dead backend errors promptly. If you
+ever see failed-upload reports and suspect the backend, check for
+`status=504` lines in the request log first.
 
 ## Recreating this deployment
 

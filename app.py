@@ -19,14 +19,19 @@ from flask import Flask, Response, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 BACKEND = "http://127.0.0.1:5000"
-# Matches DSM's own reverse-proxy timeouts exactly (confirmed against the
-# live config, /usr/syno/etc/www/ReverseProxy.json: proxy_connect_timeout /
-# proxy_read_timeout / proxy_send_timeout are all 60). This proxy sits
-# inside that reverse proxy's timeout budget, so a shorter value here (it
-# was previously 15s) makes this proxy a stricter bottleneck than DSM's
-# own front door - large uploads that DSM would tolerate could time out
-# here instead, surfacing to the uploader as a generic connection error.
-REQUEST_TIMEOUT = 60
+# (connect, read) timeout for the forward to the DSM backend. Read timeout
+# deliberately None: this proxy buffers the entire upload body (get_data())
+# before forwarding, so this timeout only gates DSM's *processing* time
+# after the upload has fully arrived. The browser-facing timeout authority
+# is the outer DSM reverse proxy (/usr/syno/etc/www/ReverseProxy.json,
+# confirmed live: proxy_read_timeout / proxy_send_timeout / client_body_timeout
+# are all 60s), which already arbitrates a hung or slow backend. This proxy
+# must never impose a stricter bound than the platform it sits inside of -
+# a large or slow upload that DSM tolerates must not be killed here (it was
+# previously 15s, then 60s, and surfacing as a generic connection error).
+# Connect stays a fast-fail (5s) so a dead backend errors out promptly
+# rather than hanging a thread.
+REQUEST_TIMEOUT = (5, None)
 MIN_SIZE_RATIO = 0.5  # modified output must be at least this fraction of the original size
 
 # Photo Request pages (as opposed to album sharing pages) always render a
