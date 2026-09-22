@@ -1,71 +1,86 @@
 ---
 name: query-request-logs
-description: Queries the synology-photos-proxy's SQLite request log on the live NAS deployment to inspect proxied requests (including failed Photo Request uploads). Use when asked to check failed uploads, error rates, recent traffic, or anything about this proxy's request logs/history.
+description: Queries the synology-photos-proxy's request log in Loki on the live NAS deployment to inspect proxied requests (including failed Photo Request uploads). Use when asked to check failed uploads, error rates, recent traffic, or anything about this proxy's request logs/history.
 ---
 
-# Querying the proxy's request log
+# Querying the proxy's request log (Loki)
 
-`app.py` logs every proxied request (method, path, status code, client IP,
-timestamp) to a SQLite database, pruning rows older than 14 days on every
-write (see `RETENTION_DAYS` in `app.py`). This is the only place failed
-Photo Request uploads are ever recorded - Synology Photos itself keeps no
-log of upload failures.
+`app.py` logs every proxied request as one plain line via `logging.info`:
 
-## Schema
-
-```sql
-CREATE TABLE requests (
-    ts TEXT NOT NULL,        -- ISO 8601 UTC, e.g. 2026-09-22T20:37:41.487240+00:00
-    method TEXT NOT NULL,    -- GET / POST / HEAD
-    path TEXT NOT NULL,
-    status INTEGER NOT NULL, -- HTTP status the backend returned
-    client_ip TEXT
-);
+```
+proxied method=POST path=/mo/request/REQ123/upload status=413 client_ip=1.2.3.4
 ```
 
-No request/response bodies are stored - only the outcome. A failed upload is
-a `POST` row with `status >= 400`.
+The container's Docker logging driver (`driver: loki`, see
+`docker-compose.deploy.yml`) ships that line to a Loki instance running on
+the NAS (deployed from `loki/` in this repo). Loki indexes and stores it
+with a 14-day retention (`limits_config.retention_period` in
+`loki/loki-config.yaml`) - there is no database or logging code in the app
+itself beyond that one log line. This is the only record of failed Photo
+Request uploads - Synology Photos itself keeps none.
+
+## Labels
+
+The Docker Loki driver auto-attaches these labels (no app-side config
+needed): `compose_service="synology-photos-proxy"`, `compose_project`,
+`container_name`, `host`. Everything else (method/path/status/client_ip)
+is plain text inside the log line, not a label - extract it with a LogQL
+`regexp` stage.
 
 ## Location
 
-- NAS SSH alias: `synology-nas` (in `~/.ssh/config` - use it as-is, never
+- NAS SSH alias: `synology-nas` (in `~/.ssh/config` - use as-is, never
   inline user/key/host/port).
-- Container name: `synology-photos-proxy-synology-photos-proxy-1`
-- DB path inside the container: `/data/requests.db`
+- Loki's query API: `http://127.0.0.1:3100` - loopback-only on the NAS, so
+  queries must run from the NAS itself (via `ssh synology-nas "curl ..."`)
+  or through an SSH tunnel, not directly from this machine.
 
 ## Running a query
 
-The container image (`python:3.13-slim`) has no `sqlite3` CLI binary -
-only Python's stdlib `sqlite3` module. Query through `python3 -c`:
+```bash
+ssh synology-nas 'curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
+  --data-urlencode '"'"'query={compose_service="synology-photos-proxy"} | regexp `method=(?P<method>\S+) path=(?P<path>\S+) status=(?P<status>\d+) client_ip=(?P<client_ip>\S+)` <FILTER>'"'"' \
+  --data-urlencode "limit=50" --data-urlencode "direction=backward"' | python3 -m json.tool
+```
+
+Common `<FILTER>` clauses (append after the `regexp` stage):
+
+```logql
+# Failed requests (any method), most recent first
+| status >= 400
+
+# Failed uploads only
+| method = "POST" | status >= 400
+
+# Everything from one client IP
+| client_ip = "1.2.3.4"
+```
+
+Simpler substring-only queries (no field filtering, just grep-style) work
+without the `regexp` stage, e.g. all 4xx/5xx lines:
 
 ```bash
-ssh synology-nas "sudo /usr/local/bin/docker exec synology-photos-proxy-synology-photos-proxy-1 python3 -c \"
-import sqlite3
-for row in sqlite3.connect('/data/requests.db').execute('''<SQL HERE>'''):
-    print(row)
-\""
+ssh synology-nas 'curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
+  --data-urlencode '"'"'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5"'"'"' \
+  --data-urlencode "limit=50"' | python3 -m json.tool
 ```
 
-Common queries (substitute into `<SQL HERE>` above):
+Add `--data-urlencode "start=<unix_nanoseconds>"` /
+`--data-urlencode "end=<unix_nanoseconds>"` to narrow the time range;
+without them Loki defaults to the last 1 hour, which is often too narrow
+for "did this fail yesterday" questions.
 
-```sql
--- Failed requests (any method), most recent first
-SELECT ts, method, path, status, client_ip FROM requests WHERE status >= 400 ORDER BY ts DESC
+## Sanity-checking the pipeline
 
--- Failed uploads only
-SELECT ts, path, status, client_ip FROM requests WHERE method = 'POST' AND status >= 400 ORDER BY ts DESC
+```bash
+# Is Loki up?
+ssh synology-nas "curl -s http://127.0.0.1:3100/ready"
 
--- Everything from one client IP
-SELECT ts, method, path, status FROM requests WHERE client_ip = '1.2.3.4' ORDER BY ts
-
--- Status code breakdown for the last 14 days (all that's retained)
-SELECT status, COUNT(*) FROM requests GROUP BY status ORDER BY COUNT(*) DESC
-
--- Traffic in the last 24 hours
-SELECT ts, method, path, status, client_ip FROM requests
-WHERE ts >= strftime('%Y-%m-%dT%H:%M:%f', 'now', '-1 day') ORDER BY ts DESC
+# Is the proxy container actually configured to ship logs to it?
+ssh synology-nas "sudo /usr/local/bin/docker inspect synology-photos-proxy-synology-photos-proxy-1 --format '{{.HostConfig.LogConfig}}'"
 ```
 
-If the exec fails, check `ssh synology-nas "sudo /usr/local/bin/docker ps"`
-for the current container name first - it may have changed after a
-redeploy.
+If the container's `LogConfig.Type` isn't `loki`, it was started before the
+logging driver was added to `docker-compose.yml` - it needs
+`docker compose up -d` to recreate it (a plain restart does not change the
+logging driver).

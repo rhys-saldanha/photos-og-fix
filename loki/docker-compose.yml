@@ -1,0 +1,15 @@
+services:
+  loki:
+    image: grafana/loki:3.7.8
+    restart: unless-stopped
+    # loopback only - the proxy talks to it over 127.0.0.1, nothing external
+    # needs direct access to Loki's HTTP API.
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+volumes:
+  loki-data:

@@ -6,10 +6,10 @@ services:
     # shares the host's network namespace rather than a bridge network.
     network_mode: host
     restart: unless-stopped
-    environment:
-      - DB_PATH=/data/requests.db
-    volumes:
-      - photos-proxy-data:/data
-
-volumes:
-  photos-proxy-data:
+    # Requires the Loki Docker logging driver plugin installed on the host
+    # and a Loki instance running (see loki/) - `docker logs` still works
+    # normally alongside this (see loki/docker-compose.yml comment).
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://127.0.0.1:3100/loki/api/v1/push"

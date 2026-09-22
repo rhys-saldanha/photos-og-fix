@@ -7,8 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-RUN useradd --system --no-create-home appuser \
-    && mkdir -p /data && chown appuser:appuser /data
+RUN useradd --system --no-create-home appuser
 USER appuser
 
 EXPOSE 8181

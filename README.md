@@ -69,7 +69,26 @@ Re-assign the certificate from step 1 to this new Reverse Proxy service
 entry (**Control Panel > Security > Certificate > Settings**) - DSM treats
 each reverse-proxied hostname as its own cert-assignable service.
 
-### 3. Deploy the proxy container
+### 3. Deploy Loki (for request logging)
+
+Install the Loki Docker logging driver plugin on the NAS host once (a
+Docker daemon-level change, not a container):
+
+```bash
+docker plugin install grafana/loki-docker-driver:3.7.8-amd64 --alias loki --grant-all-permissions
+```
+
+Then deploy Loki itself, e.g. under `/volume1/docker/loki/` using the
+`loki/` directory in this repo (`docker-compose.yml` + `loki-config.yaml`,
+retention set to 14 days):
+
+```bash
+docker compose up -d
+```
+
+It listens on `127.0.0.1:3100` only - not exposed beyond the NAS itself.
+
+### 4. Deploy the proxy container
 
 On the NAS, e.g. under `/volume1/docker/synology-photos-proxy/`:
 
@@ -83,13 +102,10 @@ services:
     # shares the host's network namespace rather than a bridge network.
     network_mode: host
     restart: unless-stopped
-    environment:
-      - DB_PATH=/data/requests.db
-    volumes:
-      - photos-proxy-data:/data
-
-volumes:
-  photos-proxy-data:
+    logging:
+      driver: loki
+      options:
+        loki-url: "http://127.0.0.1:3100/loki/api/v1/push"
 ```
 
 ```bash
@@ -99,7 +115,7 @@ docker compose up -d
 The container listens on `127.0.0.1:8181`, matching the Reverse Proxy rule
 from step 2.
 
-### 4. Verify
+### 5. Verify
 
 ```bash
 curl -s https://<your-domain>/mo/sharing/<some-share-id> | grep og:image
@@ -109,18 +125,22 @@ curl -s https://<your-domain>/mo/sharing/<some-share-id> | grep og:image
 
 ## Request logging
 
-Every proxied request (method, path, status code, client IP, timestamp) is
-recorded to a SQLite database at `DB_PATH` (`/data/requests.db` in the
-deployed container). Rows older than 14 days are pruned automatically on
-each write - no separate cleanup job needed. Synology Photos itself doesn't
-log Photo Request upload failures anywhere, so this is the only place to
-see them: uploads show up as `POST` rows, and a non-2xx `status` is a
-failed one.
+The app logs every proxied request as a plain `logging.info` line (method,
+path, status code, client IP). The Docker Loki logging driver attached to
+the container (see step 3/4 above) ships that line to Loki, which indexes
+and stores it with a 14-day retention - no logging code lives in the app
+beyond the one log line. Synology Photos itself doesn't log Photo Request
+upload failures anywhere, so this is the only place to see them: uploads
+show up as `method="POST"` lines, and a non-2xx `status` is a failed one.
 
 ```bash
-docker exec <container> sqlite3 /data/requests.db \
-  "SELECT ts, method, path, status, client_ip FROM requests WHERE status >= 400 ORDER BY ts DESC"
+curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
+  --data-urlencode 'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5"' \
+  --data-urlencode 'limit=50' | python3 -m json.tool
 ```
+
+See `.opencode/skill/query-request-logs/` for the full set of example
+LogQL queries.
 
 ## Redeploying after a change
 

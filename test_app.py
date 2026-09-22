@@ -2,10 +2,6 @@
 Self-check for app.py's fix_og_tags(). No framework, no fixtures - just
 asserts. Run with: python3 test_app.py
 """
-import os
-import sqlite3
-import tempfile
-from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from bs4 import BeautifulSoup
@@ -363,26 +359,12 @@ def test_proxy_trusts_forwarded_proto_and_host():
     )
 
 
-def test_log_request_records_row_and_prunes_old_rows():
-    with tempfile.TemporaryDirectory() as tmp:
-        db_path = os.path.join(tmp, "requests.db")
-        with patch.object(app_module, "DB_PATH", db_path):
-            old_ts = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
-            with app_module._db() as conn:
-                conn.execute(
-                    "INSERT INTO requests (ts, method, path, status, client_ip) VALUES (?, ?, ?, ?, ?)",
-                    (old_ts, "POST", "/old", 500, "1.2.3.4"),
-                )
-
-            app_module.log_request("POST", "/mo/request/REQ123", 413, "5.6.7.8")
-
-        rows = sqlite3.connect(db_path).execute(
-            "SELECT method, path, status, client_ip FROM requests"
-        ).fetchall()
-    assert rows == [("POST", "/mo/request/REQ123", 413, "5.6.7.8")]  # old row pruned, new row kept
-
-
 def test_proxy_logs_upload_failure_status():
+    """The only record of a failed Photo Request upload is this log line -
+    Loki (via the Docker logging driver attached to the container) is what
+    actually stores and retains it, so this just checks the line itself
+    carries the right method/path/status/client_ip tokens for `| regexp`
+    to pull out downstream."""
     client = app_module.app.test_client()
     mock_resp = MagicMock()
     mock_resp.status_code = 413
@@ -390,11 +372,12 @@ def test_proxy_logs_upload_failure_status():
     mock_resp.content = b'{"error": "too large"}'
 
     with patch("app.requests.request", return_value=mock_resp):
-        with patch.object(app_module, "log_request") as mock_log:
+        with patch("app.logging.info") as mock_log:
             client.post("/mo/request/webapi/entry.cgi/upload", data=b"filedata")
 
     mock_log.assert_called_once_with(
-        "POST", "/mo/request/webapi/entry.cgi/upload", 413, mock_log.call_args.args[3]
+        "proxied method=%s path=%s status=%s client_ip=%s",
+        "POST", "/mo/request/webapi/entry.cgi/upload", 413, mock_log.call_args.args[4],
     )
 
 
