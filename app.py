@@ -8,6 +8,7 @@ log". If anything about the page doesn't match what we expect, the original,
 untouched response is returned. This proxy should never be the reason a page
 breaks - at worst it just fails to improve the preview.
 """
+import json
 import logging
 import re
 from urllib.parse import urljoin, urlparse
@@ -56,25 +57,27 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 _HOP_BY_HOP = {"content-length", "transfer-encoding", "content-encoding", "connection"}
 
 
-def api_outcome(resp: requests.Response, content_type: str) -> tuple[bool | None, int | None]:
-    """Best-effort read of DSM's own success/error envelope on JSON API
-    responses. DSM frequently returns HTTP 200 even for logical failures -
-    confirmed against the live backend, where an invalid photo-request
-    lookup came back 200 with {"success": false, "error": {"code": 101}} -
-    so the HTTP status alone misses these. Returns (None, None) for
-    anything that isn't that envelope (non-JSON, malformed JSON, or JSON
-    without a "success" key); never raises."""
+MAX_LOGGED_BODY = 2000  # bound one log line's size; DSM API responses are normally tiny
+
+
+def json_body_for_log(resp: requests.Response, content_type: str) -> str:
+    """Compact-reserialize any JSON response body so it can be logged
+    verbatim. Deliberately logs the WHOLE body rather than picking out
+    specific fields (e.g. just "success"/"error") - DSM's response shapes
+    are undocumented, inconsistent, and this proxy already got caught
+    guessing wrong once (a prior version only checked a "success" key,
+    which missed anything that didn't use it). "-" for anything that
+    isn't a JSON response; never raises."""
     if "application/json" not in content_type:
-        return None, None
+        return "-"
     try:
         payload = resp.json()
     except ValueError:
-        return None, None
-    if not isinstance(payload, dict) or "success" not in payload:
-        return None, None
-    error = payload.get("error")
-    code = error.get("code") if isinstance(error, dict) else None
-    return bool(payload["success"]), code
+        return "-"
+    text = json.dumps(payload, separators=(",", ":"))
+    if len(text) > MAX_LOGGED_BODY:
+        text = text[:MAX_LOGGED_BODY] + "...TRUNCATED"
+    return text
 
 
 def absolutize_og_image(soup: BeautifulSoup, page_url: str) -> bool:
@@ -307,23 +310,23 @@ def proxy(path):
             body, request.url, cookies=resp.cookies.get_dict(), extra_headers=client_ip_headers
         )
 
-    api_success, api_error_code = api_outcome(resp, content_type)
-
-    # Deliberately plain key=value tokens (not a dict/json.dumps call) so the
-    # line stays greppable in `docker logs` as well as queryable in Loki via
-    # `| regexp "status=(?P<status>\d+)"` - this is the only record of
-    # failed Photo Request uploads, since Synology Photos itself keeps none.
-    # api_success/api_error_code cover DSM's HTTP-200-but-logically-failed
-    # responses that the HTTP status code alone can't catch (see
-    # api_outcome); "-" means "not a DSM JSON envelope, not applicable".
+    # method/path/status/client_ip are plain key=value tokens, greppable in
+    # `docker logs` and regex-extractable in Loki. body is the full JSON
+    # response verbatim (see json_body_for_log) - DSM's failure shapes are
+    # undocumented and inconsistent (confirmed against the live backend: a
+    # successful upload looks like {"data":{"action":"new","id":...},
+    # "success":true}, a rejected one like {"error":{"code":101},
+    # "success":false}, both over HTTP 200) so this proxy logs the whole
+    # body rather than pre-guessing which fields matter. This is the only
+    # record of failed Photo Request uploads - Synology Photos itself
+    # keeps none.
     logging.info(
-        "proxied method=%s path=%s status=%s client_ip=%s api_success=%s api_error_code=%s",
+        "proxied method=%s path=%s status=%s client_ip=%s body=%s",
         request.method,
         request.path,
         resp.status_code,
         request.remote_addr,
-        api_success if api_success is not None else "-",
-        api_error_code if api_error_code is not None else "-",
+        json_body_for_log(resp, content_type),
     )
 
     response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP]

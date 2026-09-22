@@ -2,6 +2,7 @@
 Self-check for app.py's fix_og_tags(). No framework, no fixtures - just
 asserts. Run with: python3 test_app.py
 """
+import json
 from unittest.mock import MagicMock, patch
 
 from bs4 import BeautifulSoup
@@ -361,68 +362,90 @@ def test_proxy_trusts_forwarded_proto_and_host():
 
 def test_proxy_logs_http_level_upload_failure():
     """A real HTTP-level failure (e.g. a reverse-proxy size-limit reject)
-    must show up in the log with its actual status code. The body here
-    isn't DSM's success/error envelope (no "success" key), so api_success
-    and api_error_code must both come through as "-" - not applicable."""
+    must show up in the log with its actual status code."""
     client = app_module.app.test_client()
     mock_resp = MagicMock()
     mock_resp.status_code = 413
-    mock_resp.headers = {"Content-Type": "application/json"}
-    mock_resp.content = b'{"error": "too large"}'
-    mock_resp.json.return_value = {"error": "too large"}
+    mock_resp.headers = {"Content-Type": "text/html"}
+    mock_resp.content = b"<html>413 Request Entity Too Large</html>"
 
     with patch("app.requests.request", return_value=mock_resp):
         with patch("app.logging.info") as mock_log:
             client.post("/mo/request/webapi/entry.cgi/upload", data=b"filedata")
 
     mock_log.assert_called_once_with(
-        "proxied method=%s path=%s status=%s client_ip=%s api_success=%s api_error_code=%s",
-        "POST", "/mo/request/webapi/entry.cgi/upload", 413, mock_log.call_args.args[4], "-", "-",
+        "proxied method=%s path=%s status=%s client_ip=%s body=%s",
+        "POST", "/mo/request/webapi/entry.cgi/upload", 413, mock_log.call_args.args[4], "-",
     )
 
 
-def test_proxy_logs_dsm_api_level_failure_despite_200_status():
-    """Confirmed against the live backend: DSM can return HTTP 200 with a
-    {"success": false, "error": {"code": ...}} body for a logical failure.
-    Without reading the body, that failure would be invisible in the log
-    (status=200 looks identical to a real success) - api_success/
-    api_error_code exist specifically to catch this case."""
+def test_proxy_logs_full_json_body_of_real_captured_dsm_failure():
+    """Confirmed against the live backend: DSM returns HTTP 200 even for a
+    genuine failure (sent a real upload request missing the file field to
+    the real SYNO.Foto.Upload.PhotoRequestItem endpoint). The whole body
+    is logged verbatim, not picked apart into specific fields - DSM's
+    failure shapes are undocumented, so status=200 must not be mistaken
+    for success, and the exact structure of a failure isn't assumed."""
     client = app_module.app.test_client()
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.headers = {"Content-Type": "application/json"}
-    body = {"success": False, "error": {"code": 101}}
-    mock_resp.content = b'{"success": false, "error": {"code": 101}}'
+    body = {"error": {"code": 101}, "success": False}
+    mock_resp.content = json.dumps(body).encode()
     mock_resp.json.return_value = body
 
     with patch("app.requests.request", return_value=mock_resp):
         with patch("app.logging.info") as mock_log:
             client.post(
-                "/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase", data=b"passphrase=x"
+                "/mo/request/webapi/entry.cgi/SYNO.Foto.Upload.PhotoRequestItem",
+                data=b"name=missing-file-field.jpg",
             )
 
     mock_log.assert_called_once_with(
-        "proxied method=%s path=%s status=%s client_ip=%s api_success=%s api_error_code=%s",
+        "proxied method=%s path=%s status=%s client_ip=%s body=%s",
         "POST",
-        "/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase",
+        "/mo/request/webapi/entry.cgi/SYNO.Foto.Upload.PhotoRequestItem",
         200,
         mock_log.call_args.args[4],
-        False,
-        101,
+        '{"error":{"code":101},"success":false}',
     )
 
 
-def test_api_outcome_ignores_non_json_and_malformed_bodies():
+def test_proxy_logs_full_json_body_of_real_captured_dsm_success():
+    """Same real endpoint, but the actual success shape captured from a
+    live (test) upload - included so the log format is exercised against
+    both real outcomes, not just the failure one."""
+    client = app_module.app.test_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"Content-Type": "application/json"}
+    body = {"data": {"action": "new", "id": 44468, "unit_id": 44468}, "success": True}
+    mock_resp.content = json.dumps(body).encode()
+    mock_resp.json.return_value = body
+
+    with patch("app.requests.request", return_value=mock_resp):
+        with patch("app.logging.info") as mock_log:
+            client.post("/mo/request/webapi/entry.cgi/SYNO.Foto.Upload.PhotoRequestItem")
+
+    logged_body = mock_log.call_args.args[5]
+    assert logged_body == '{"data":{"action":"new","id":44468,"unit_id":44468},"success":true}'
+
+
+def test_json_body_for_log_ignores_non_json_and_malformed_bodies():
     html_resp = MagicMock()
-    assert app_module.api_outcome(html_resp, "text/html") == (None, None)
+    assert app_module.json_body_for_log(html_resp, "text/html") == "-"
 
     bad_json_resp = MagicMock()
     bad_json_resp.json.side_effect = ValueError("not json")
-    assert app_module.api_outcome(bad_json_resp, "application/json") == (None, None)
+    assert app_module.json_body_for_log(bad_json_resp, "application/json") == "-"
 
-    no_success_key_resp = MagicMock()
-    no_success_key_resp.json.return_value = {"data": "whatever"}
-    assert app_module.api_outcome(no_success_key_resp, "application/json") == (None, None)
+
+def test_json_body_for_log_truncates_oversized_bodies():
+    huge_resp = MagicMock()
+    huge_resp.json.return_value = {"items": ["x"] * 2000}
+    logged = app_module.json_body_for_log(huge_resp, "application/json")
+    assert logged.endswith("...TRUNCATED")
+    assert len(logged) == app_module.MAX_LOGGED_BODY + len("...TRUNCATED")
 
 
 if __name__ == "__main__":

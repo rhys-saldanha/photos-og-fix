@@ -126,23 +126,31 @@ curl -s https://<your-domain>/mo/sharing/<some-share-id> | grep og:image
 ## Request logging
 
 The app logs every proxied request as a plain `logging.info` line: method,
-path, status code, client IP, and (for JSON API responses) DSM's own
-`success`/`error` envelope as `api_success`/`api_error_code`. The Docker
-Loki logging driver attached to the container (see step 3/4 above) ships
-that line to Loki, which indexes and stores it with a 14-day retention -
-no logging code lives in the app beyond that one line.
+path, status code, client IP, and the **entire JSON response body**
+verbatim (compact-reserialized, capped at `MAX_LOGGED_BODY`) when the
+response is `application/json`; `-` otherwise. The Docker Loki logging
+driver attached to the container (see step 3/4 above) ships that line to
+Loki, which indexes and stores it with a 14-day retention - no logging
+code lives in the app beyond that one line.
 
 Synology Photos itself doesn't log Photo Request upload failures anywhere,
-so this is the only place to see them - and the `api_success`/
-`api_error_code` fields matter here: confirmed against the live backend,
-DSM often returns HTTP **200** even for a logical failure (body
-`{"success": false, "error": {"code": ...}}`), so the HTTP status alone
-misses these. A failed upload is either a non-2xx `status`, or a 2xx
-`status` with `api_success=False`.
+so this is the only place to see them. The whole body is logged rather
+than picking out specific fields (an earlier version of this only checked
+a `success` key and missed anything that didn't use it) because DSM's
+response shapes are undocumented and inconsistent - confirmed against the
+live backend:
+
+- A successful upload: `{"data":{"action":"new","id":44468,"unit_id":44468},"success":true}`
+- A rejected one: `{"error":{"code":101},"success":false}`
+
+Both over HTTP **200** - the status code alone can't tell them apart, and
+some failure modes (e.g. an unsupported file extension) are rejected
+client-side by the browser's own JS and never reach the server at all, so
+no logging here can catch those.
 
 ```bash
 curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
-  --data-urlencode 'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5" or "api_success=False"' \
+  --data-urlencode 'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5" or "\"success\":false"' \
   --data-urlencode 'limit=50' | python3 -m json.tool
 ```
 
