@@ -9,7 +9,10 @@ untouched response is returned. This proxy should never be the reason a page
 breaks - at worst it just fails to improve the preview.
 """
 import logging
+import os
 import re
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -20,6 +23,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 BACKEND = "http://127.0.0.1:5000"
 REQUEST_TIMEOUT = 15
 MIN_SIZE_RATIO = 0.5  # modified output must be at least this fraction of the original size
+# Defaults to a file in the working directory for local/dev/test runs; the
+# deployed container overrides this to a volume-mounted path so the log
+# survives restarts.
+DB_PATH = os.environ.get("DB_PATH", "requests.db")
+RETENTION_DAYS = 14
 
 # Photo Request pages (as opposed to album sharing pages) always render a
 # generic title/icon regardless of the request's actual subject - but the
@@ -54,6 +62,35 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 _HOP_BY_HOP = {"content-length", "transfer-encoding", "content-encoding", "connection"}
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS requests ("
+        "ts TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, "
+        "status INTEGER NOT NULL, client_ip TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)")
+    return conn
+
+
+def log_request(method: str, path: str, status: int, client_ip: str | None) -> None:
+    """Record every proxied request (so failed Photo Request uploads show
+    up as POSTs with a 4xx/5xx status) and prune anything older than
+    RETENTION_DAYS in the same transaction - traffic here is low enough
+    that a separate cleanup job/thread would be pure overhead. Never
+    raises - logging must not be able to break the actual proxying."""
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO requests (ts, method, path, status, client_ip) VALUES (?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), method, path, status, client_ip),
+            )
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
+            conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
+    except Exception:
+        logging.exception("failed to log request %s %s", method, path)
 
 
 def absolutize_og_image(soup: BeautifulSoup, page_url: str) -> bool:
@@ -285,6 +322,8 @@ def proxy(path):
         body = fix_og_tags(
             body, request.url, cookies=resp.cookies.get_dict(), extra_headers=client_ip_headers
         )
+
+    log_request(request.method, request.path, resp.status_code, request.remote_addr)
 
     response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP]
     return Response(body, status=resp.status_code, headers=response_headers)

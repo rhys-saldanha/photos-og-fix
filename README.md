@@ -83,6 +83,13 @@ services:
     # shares the host's network namespace rather than a bridge network.
     network_mode: host
     restart: unless-stopped
+    environment:
+      - DB_PATH=/data/requests.db
+    volumes:
+      - photos-proxy-data:/data
+
+volumes:
+  photos-proxy-data:
 ```
 
 ```bash
@@ -99,6 +106,21 @@ curl -s https://<your-domain>/mo/sharing/<some-share-id> | grep og:image
 ```
 
 `og:image` should be a full `https://...` URL, not a relative path.
+
+## Request logging
+
+Every proxied request (method, path, status code, client IP, timestamp) is
+recorded to a SQLite database at `DB_PATH` (`/data/requests.db` in the
+deployed container). Rows older than 14 days are pruned automatically on
+each write - no separate cleanup job needed. Synology Photos itself doesn't
+log Photo Request upload failures anywhere, so this is the only place to
+see them: uploads show up as `POST` rows, and a non-2xx `status` is a
+failed one.
+
+```bash
+docker exec <container> sqlite3 /data/requests.db \
+  "SELECT ts, method, path, status, client_ip FROM requests WHERE status >= 400 ORDER BY ts DESC"
+```
 
 ## Redeploying after a change
 

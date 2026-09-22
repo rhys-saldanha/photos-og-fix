@@ -6,3 +6,10 @@ services:
     # shares the host's network namespace rather than a bridge network.
     network_mode: host
     restart: unless-stopped
+    environment:
+      - DB_PATH=/data/requests.db
+    volumes:
+      - photos-proxy-data:/data
+
+volumes:
+  photos-proxy-data:
