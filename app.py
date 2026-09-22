@@ -19,7 +19,14 @@ from flask import Flask, Response, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 BACKEND = "http://127.0.0.1:5000"
-REQUEST_TIMEOUT = 15
+# Matches DSM's own reverse-proxy timeouts exactly (confirmed against the
+# live config, /usr/syno/etc/www/ReverseProxy.json: proxy_connect_timeout /
+# proxy_read_timeout / proxy_send_timeout are all 60). This proxy sits
+# inside that reverse proxy's timeout budget, so a shorter value here (it
+# was previously 15s) makes this proxy a stricter bottleneck than DSM's
+# own front door - large uploads that DSM would tolerate could time out
+# here instead, surfacing to the uploader as a generic connection error.
+REQUEST_TIMEOUT = 60
 MIN_SIZE_RATIO = 0.5  # modified output must be at least this fraction of the original size
 
 # Photo Request pages (as opposed to album sharing pages) always render a
@@ -288,14 +295,27 @@ def proxy(path):
     upstream_url = f"{BACKEND}/{path}"
     forward_headers = {k: v for k, v in request.headers if k.lower() != "host"}
 
-    resp = requests.request(
-        request.method,
-        upstream_url,
-        params=request.args,
-        headers=forward_headers,
-        data=request.get_data(),
-        timeout=REQUEST_TIMEOUT,
-    )
+    try:
+        resp = requests.request(
+            request.method,
+            upstream_url,
+            params=request.args,
+            headers=forward_headers,
+            data=request.get_data(),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as exc:
+        # Without this, a timeout/connection error here would propagate as
+        # an unhandled exception - Flask returns a 500 with no trace of it
+        # in our request log, since logging.info() below only runs after a
+        # response is actually obtained. This is the failure mode that was
+        # previously invisible to any logging this proxy did.
+        logging.exception("upstream request failed for %s %s", request.method, path)
+        logging.info(
+            "proxied method=%s path=%s status=%s client_ip=%s body=%s",
+            request.method, request.path, 504, request.remote_addr, f"proxy_error:{exc}",
+        )
+        return Response(f"Upstream request failed: {exc}", status=504)
 
     body = resp.content
     content_type = resp.headers.get("Content-Type", "")

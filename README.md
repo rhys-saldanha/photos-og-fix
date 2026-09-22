@@ -36,6 +36,19 @@ original response is returned untouched and the error is logged.** This
 proxy should never be the reason a page breaks; at worst it fails to improve
 a preview.
 
+## A gotcha worth knowing: upstream timeout budget
+
+`REQUEST_TIMEOUT` in `app.py` (used when forwarding to the real DSM
+backend) is set to match DSM's own reverse-proxy timeouts exactly (60s -
+confirmed against `/usr/syno/etc/www/ReverseProxy.json` on the live NAS).
+Since this proxy sits *inside* that reverse proxy's timeout budget, a
+shorter value here makes this proxy a stricter bottleneck than DSM's own
+front door - large uploads (especially video, which DSM has to transcode/
+thumbnail server-side) that DSM would tolerate could time out here
+instead, surfacing to the uploader as a generic connection error. If you
+ever see failed-upload reports and suspect this, check for
+`status=504 body=proxy_error:...` lines in the request log first.
+
 ## Recreating this deployment
 
 This assumes a Synology NAS with Container Manager (Docker) installed, and

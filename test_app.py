@@ -379,6 +379,30 @@ def test_proxy_logs_http_level_upload_failure():
     )
 
 
+def test_proxy_logs_and_returns_504_on_upstream_timeout():
+    """A timeout/connection failure to the backend must not propagate as
+    an unhandled exception (which would 500 with zero trace in our log) -
+    it must be caught, logged (status=504, so it's visible to the same
+    "status >= 400" queries as any other failure), and turned into a real
+    504 response. This is the previously-invisible failure mode for large
+    uploads: see the REQUEST_TIMEOUT comment in app.py."""
+    client = app_module.app.test_client()
+
+    with patch(
+        "app.requests.request",
+        side_effect=app_module.requests.exceptions.ReadTimeout("timed out"),
+    ):
+        with patch("app.logging.info") as mock_log:
+            resp = client.post("/mo/request/webapi/entry.cgi/upload", data=b"filedata")
+
+    assert resp.status_code == 504
+    mock_log.assert_called_once_with(
+        "proxied method=%s path=%s status=%s client_ip=%s body=%s",
+        "POST", "/mo/request/webapi/entry.cgi/upload", 504, mock_log.call_args.args[4],
+        "proxy_error:timed out",
+    )
+
+
 def test_proxy_logs_full_json_body_of_real_captured_dsm_failure():
     """Confirmed against the live backend: DSM returns HTTP 200 even for a
     genuine failure (sent a real upload request missing the file field to
