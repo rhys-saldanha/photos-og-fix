@@ -8,7 +8,7 @@ description: Queries the synology-photos-proxy's request log in Loki on the live
 `app.py` logs every proxied request as one plain line via `logging.info`:
 
 ```
-proxied method=POST path=/mo/request/REQ123/upload status=413 client_ip=1.2.3.4
+proxied method=POST path=/mo/request/REQ123/upload status=413 client_ip=1.2.3.4 api_success=- api_error_code=-
 ```
 
 The container's Docker logging driver (`driver: loki`, see
@@ -18,6 +18,15 @@ with a 14-day retention (`limits_config.retention_period` in
 `loki/loki-config.yaml`) - there is no database or logging code in the app
 itself beyond that one log line. This is the only record of failed Photo
 Request uploads - Synology Photos itself keeps none.
+
+**`status` alone is not enough to detect a failed upload.** Confirmed
+against the live backend: DSM often returns HTTP `200` even for a logical
+failure, wrapping it in a JSON body like
+`{"success": false, "error": {"code": 101}}`. `api_outcome()` in `app.py`
+reads that envelope on any `application/json` response and logs it as
+`api_success`/`api_error_code`; both are `-` when the response isn't that
+envelope (HTML, images, non-DSM JSON, etc.). A failed upload is therefore
+either `status >= 400`, **or** `api_success=False` regardless of status.
 
 ## Labels
 
@@ -39,29 +48,35 @@ is plain text inside the log line, not a label - extract it with a LogQL
 
 ```bash
 ssh synology-nas 'curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
-  --data-urlencode '"'"'query={compose_service="synology-photos-proxy"} | regexp `method=(?P<method>\S+) path=(?P<path>\S+) status=(?P<status>\d+) client_ip=(?P<client_ip>\S+)` <FILTER>'"'"' \
+  --data-urlencode '"'"'query={compose_service="synology-photos-proxy"} | regexp `method=(?P<method>\S+) path=(?P<path>\S+) status=(?P<status>\d+) client_ip=(?P<client_ip>\S+) api_success=(?P<api_success>\S+) api_error_code=(?P<api_error_code>\S+)` <FILTER>'"'"' \
   --data-urlencode "limit=50" --data-urlencode "direction=backward"' | python3 -m json.tool
 ```
 
 Common `<FILTER>` clauses (append after the `regexp` stage):
 
 ```logql
-# Failed requests (any method), most recent first
-| status >= 400
+# All failed requests, HTTP-level and DSM-API-level, most recent first
+| status >= 400 or api_success = "False"
 
 # Failed uploads only
-| method = "POST" | status >= 400
+| method = "POST" and (status >= 400 or api_success = "False")
+
+# HTTP-level failures only (network/reverse-proxy/backend rejects)
+| status >= 400
+
+# DSM logical failures that still returned HTTP 200 (see caveat above)
+| api_success = "False"
 
 # Everything from one client IP
 | client_ip = "1.2.3.4"
 ```
 
 Simpler substring-only queries (no field filtering, just grep-style) work
-without the `regexp` stage, e.g. all 4xx/5xx lines:
+without the `regexp` stage, e.g. either kind of failure:
 
 ```bash
 ssh synology-nas 'curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
-  --data-urlencode '"'"'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5"'"'"' \
+  --data-urlencode '"'"'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5" or "api_success=False"'"'"' \
   --data-urlencode "limit=50"' | python3 -m json.tool
 ```
 

@@ -359,26 +359,70 @@ def test_proxy_trusts_forwarded_proto_and_host():
     )
 
 
-def test_proxy_logs_upload_failure_status():
-    """The only record of a failed Photo Request upload is this log line -
-    Loki (via the Docker logging driver attached to the container) is what
-    actually stores and retains it, so this just checks the line itself
-    carries the right method/path/status/client_ip tokens for `| regexp`
-    to pull out downstream."""
+def test_proxy_logs_http_level_upload_failure():
+    """A real HTTP-level failure (e.g. a reverse-proxy size-limit reject)
+    must show up in the log with its actual status code. The body here
+    isn't DSM's success/error envelope (no "success" key), so api_success
+    and api_error_code must both come through as "-" - not applicable."""
     client = app_module.app.test_client()
     mock_resp = MagicMock()
     mock_resp.status_code = 413
     mock_resp.headers = {"Content-Type": "application/json"}
     mock_resp.content = b'{"error": "too large"}'
+    mock_resp.json.return_value = {"error": "too large"}
 
     with patch("app.requests.request", return_value=mock_resp):
         with patch("app.logging.info") as mock_log:
             client.post("/mo/request/webapi/entry.cgi/upload", data=b"filedata")
 
     mock_log.assert_called_once_with(
-        "proxied method=%s path=%s status=%s client_ip=%s",
-        "POST", "/mo/request/webapi/entry.cgi/upload", 413, mock_log.call_args.args[4],
+        "proxied method=%s path=%s status=%s client_ip=%s api_success=%s api_error_code=%s",
+        "POST", "/mo/request/webapi/entry.cgi/upload", 413, mock_log.call_args.args[4], "-", "-",
     )
+
+
+def test_proxy_logs_dsm_api_level_failure_despite_200_status():
+    """Confirmed against the live backend: DSM can return HTTP 200 with a
+    {"success": false, "error": {"code": ...}} body for a logical failure.
+    Without reading the body, that failure would be invisible in the log
+    (status=200 looks identical to a real success) - api_success/
+    api_error_code exist specifically to catch this case."""
+    client = app_module.app.test_client()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"Content-Type": "application/json"}
+    body = {"success": False, "error": {"code": 101}}
+    mock_resp.content = b'{"success": false, "error": {"code": 101}}'
+    mock_resp.json.return_value = body
+
+    with patch("app.requests.request", return_value=mock_resp):
+        with patch("app.logging.info") as mock_log:
+            client.post(
+                "/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase", data=b"passphrase=x"
+            )
+
+    mock_log.assert_called_once_with(
+        "proxied method=%s path=%s status=%s client_ip=%s api_success=%s api_error_code=%s",
+        "POST",
+        "/mo/request/webapi/entry.cgi/SYNO.Foto.Sharing.Passphrase",
+        200,
+        mock_log.call_args.args[4],
+        False,
+        101,
+    )
+
+
+def test_api_outcome_ignores_non_json_and_malformed_bodies():
+    html_resp = MagicMock()
+    assert app_module.api_outcome(html_resp, "text/html") == (None, None)
+
+    bad_json_resp = MagicMock()
+    bad_json_resp.json.side_effect = ValueError("not json")
+    assert app_module.api_outcome(bad_json_resp, "application/json") == (None, None)
+
+    no_success_key_resp = MagicMock()
+    no_success_key_resp.json.return_value = {"data": "whatever"}
+    assert app_module.api_outcome(no_success_key_resp, "application/json") == (None, None)
 
 
 if __name__ == "__main__":

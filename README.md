@@ -125,17 +125,24 @@ curl -s https://<your-domain>/mo/sharing/<some-share-id> | grep og:image
 
 ## Request logging
 
-The app logs every proxied request as a plain `logging.info` line (method,
-path, status code, client IP). The Docker Loki logging driver attached to
-the container (see step 3/4 above) ships that line to Loki, which indexes
-and stores it with a 14-day retention - no logging code lives in the app
-beyond the one log line. Synology Photos itself doesn't log Photo Request
-upload failures anywhere, so this is the only place to see them: uploads
-show up as `method="POST"` lines, and a non-2xx `status` is a failed one.
+The app logs every proxied request as a plain `logging.info` line: method,
+path, status code, client IP, and (for JSON API responses) DSM's own
+`success`/`error` envelope as `api_success`/`api_error_code`. The Docker
+Loki logging driver attached to the container (see step 3/4 above) ships
+that line to Loki, which indexes and stores it with a 14-day retention -
+no logging code lives in the app beyond that one line.
+
+Synology Photos itself doesn't log Photo Request upload failures anywhere,
+so this is the only place to see them - and the `api_success`/
+`api_error_code` fields matter here: confirmed against the live backend,
+DSM often returns HTTP **200** even for a logical failure (body
+`{"success": false, "error": {"code": ...}}`), so the HTTP status alone
+misses these. A failed upload is either a non-2xx `status`, or a 2xx
+`status` with `api_success=False`.
 
 ```bash
 curl -s -G "http://127.0.0.1:3100/loki/api/v1/query_range" \
-  --data-urlencode 'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5"' \
+  --data-urlencode 'query={compose_service="synology-photos-proxy"} |= "status=4" or "status=5" or "api_success=False"' \
   --data-urlencode 'limit=50' | python3 -m json.tool
 ```
 
