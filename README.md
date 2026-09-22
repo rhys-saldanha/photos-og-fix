@@ -144,12 +144,17 @@ LogQL queries.
 
 ## Redeploying after a change
 
+Auto-updates: the Watchtower instance already running as part of the
+reciplease deployment (`/volume1/docker/reciplease`) polls every 5 minutes
+and updates any container labelled `com.centurylinklabs.watchtower.enable=true`
+- both this proxy and Loki carry that label, so a new image pushed by CI is
+picked up within 5 minutes with no manual step.
+
+To force it immediately instead of waiting:
+
 ```bash
 docker compose pull && docker compose up -d
 ```
-
-No auto-deploy is set up - CI only builds and pushes the image on every
-push to `main`.
 
 ## Development
 

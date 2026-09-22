@@ -10,6 +10,10 @@ services:
       - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki-data:/loki
     command: -config.file=/etc/loki/local-config.yaml
+    labels:
+      # Picked up by the Watchtower instance already running as part of the
+      # reciplease deployment (/volume1/docker/reciplease).
+      - "com.centurylinklabs.watchtower.enable=true"
 
 volumes:
   loki-data:

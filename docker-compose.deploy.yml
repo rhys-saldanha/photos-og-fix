@@ -1,6 +1,6 @@
 services:
-  photos-og-fix:
-    image: ghcr.io/rhys-saldanha/photos-og-fix:latest
+  synology-photos-proxy:
+    image: ghcr.io/rhys-saldanha/synology-photos-proxy:latest
     # host networking: this proxy talks to DSM's own Photos backend at
     # 127.0.0.1:5000 on the NAS itself, which only works if the container
     # shares the host's network namespace rather than a bridge network.
@@ -13,3 +13,9 @@ services:
       driver: loki
       options:
         loki-url: "http://127.0.0.1:3100/loki/api/v1/push"
+    labels:
+      # Picked up by the Watchtower instance already running as part of the
+      # reciplease deployment (/volume1/docker/reciplease) - it polls every
+      # 5 minutes and only touches containers with this label, so this is
+      # the only wiring needed for auto-updates here.
+      - "com.centurylinklabs.watchtower.enable=true"
